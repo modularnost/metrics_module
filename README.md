@@ -23,18 +23,16 @@ the cluster has several managers.
 | | Default | |
 | --- | --- | --- |
 | `PANEL_CORE_URL` | `http://panel:8080` | |
-| `PANEL_MODULE_TOKEN` | — | skips waiting for the first user request |
 | `DB_PATH` | `/data/metrics.db` | |
 | `SAMPLE_INTERVAL` | `30s` | one `/internal/stats` call costs ~1s |
 | `RETENTION` | `168h` | older rows are deleted on every write |
 | `ADDR` | `:8080` | |
 
-## Sampling starts when someone opens the page
+## Token
 
-The core hands a module its token with the first proxied request, not at
-startup; until then the sampler logs `sample skipped`. `PANEL_MODULE_TOKEN`
-avoids that — pin `PANEL_MODULE_SECRET` on the core too, or the token goes
-stale on its next restart.
+The core sends it with every `/manifest` fetch, so sampling starts within a
+discovery TTL (15s) of either side booting, and survives the core restarting
+with a new `PANEL_MODULE_SECRET`. Needs a core new enough to do that.
 
 ## What it keeps
 

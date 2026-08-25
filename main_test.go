@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -73,6 +74,14 @@ func TestChart(t *testing.T) {
 	pts = pts[:strings.Index(pts, `"`)]
 	if !strings.Contains(pts, "50.0 %") || strings.Count(pts, "],[") != 1 {
 		t.Errorf("hover data wrong: %s", pts)
+	}
+	// Times travel as unix seconds; the browser formats them in the reader's
+	// timezone, which the module cannot know.
+	if !strings.Contains(pts, fmt.Sprint(to.Unix())) {
+		t.Errorf("hover data has no raw timestamp: %s", pts)
+	}
+	if !strings.Contains(svg, fmt.Sprintf(`data-ts="%d"`, from.Unix())) {
+		t.Errorf("axis label has no raw timestamp: %s", svg)
 	}
 	if !strings.Contains(svg, `class="cursor"`) {
 		t.Errorf("no crosshair: %s", svg)

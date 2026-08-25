@@ -30,9 +30,9 @@ var (
 	interval  = dur(os.Getenv("SAMPLE_INTERVAL"), 30*time.Second)
 	retention = dur(os.Getenv("RETENTION"), 7*24*time.Hour)
 
-	// [module, token]. Filled from the env if the core injects it, otherwise
-	// learned from the first proxied user request — the core hands a module no
-	// token at startup, so until someone opens the page nothing is sampled.
+	// [module, token]. Learned from the core's own requests, the manifest fetch
+	// included, so sampling starts within a discovery TTL of either side booting
+	// and survives the core changing its secret.
 	creds atomic.Pointer[[2]string]
 )
 
@@ -104,12 +104,10 @@ func main() {
 	}
 	defer db.Close()
 
-	if t := os.Getenv("PANEL_MODULE_TOKEN"); t != "" {
-		creds.Store(&[2]string{or(os.Getenv("PANEL_MODULE_NAME"), "metrics"), t})
-	}
 	go sampler(db)
 
 	http.HandleFunc("/manifest", func(w http.ResponseWriter, r *http.Request) {
+		remember(r) // discovery carries the token: this is where it arrives first
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, manifest)
 	})
@@ -152,7 +150,7 @@ func sampler(db *sql.DB) {
 func fetchStats() ([]stat, error) {
 	c := creds.Load()
 	if c == nil {
-		return nil, fmt.Errorf("no token yet: open the module once in the panel, or set PANEL_MODULE_TOKEN")
+		return nil, fmt.Errorf("no token yet: the core has not fetched /manifest")
 	}
 	req, err := http.NewRequest(http.MethodGet, core+"/internal/stats", nil)
 	if err != nil {
@@ -364,10 +362,12 @@ func chart(pts []point, from, to time.Time, label func(float64) string, class st
 		fmt.Fprintf(&b, `<line class="grid" x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f"/>`, padL, gy, w-padR, gy)
 		fmt.Fprintf(&b, `<text class="tick" x="%.1f" y="%.1f" text-anchor="end">%s</text>`, padL-6, gy+4, template.HTMLEscapeString(label(v)))
 	}
+	// Times carry as unix seconds and are formatted by the browser: the module
+	// runs in whatever timezone its container has, the reader does not.
 	for i, t := range []time.Time{from, from.Add(to.Sub(from) / 2), to} {
 		anchor := [...]string{"start", "middle", "end"}[i]
-		fmt.Fprintf(&b, `<text class="tick" x="%.1f" y="%.1f" text-anchor="%s">%s</text>`,
-			x(t.Unix()), h-6, anchor, t.Local().Format("02.01 15:04"))
+		fmt.Fprintf(&b, `<text class="tick when" data-ts="%d" x="%.1f" y="%.1f" text-anchor="%s">%s</text>`,
+			t.Unix(), x(t.Unix()), h-6, anchor, t.UTC().Format("02.01 15:04 UTC"))
 	}
 	if len(pts) == 0 {
 		fmt.Fprintf(&b, `<text class="tick" x="%.1f" y="%.1f" text-anchor="middle">no samples in this range</text>`, w/2, h/2)
@@ -389,11 +389,11 @@ func chart(pts []point, from, to time.Time, label func(float64) string, class st
 	fmt.Fprintf(&b, `<g class="cursor" style="display:none"><line y1="%.1f" y2="%.1f"/><circle r="3.5"/></g>`, padT, padT+plotH)
 	b.WriteString(`</svg>`)
 
-	// The hover script needs the points where they are drawn and the labels
-	// already formatted — no second implementation of human() in JS.
+	// The hover script needs the points where they are drawn, the value already
+	// formatted (no second implementation of human() in JS) and the raw time.
 	marks := make([][4]any, len(pts))
 	for i, p := range pts {
-		marks[i] = [4]any{round(x(p.T)), round(y(p.V)), time.Unix(p.T, 0).Local().Format("02.01 15:04"), label(p.V)}
+		marks[i] = [4]any{round(x(p.T)), round(y(p.V)), p.T, label(p.V)}
 	}
 	js, _ := json.Marshal(marks)
 	return figure(b.String(), string(js))
@@ -481,6 +481,14 @@ const wraps = [...document.querySelectorAll('.chartwrap')];
 const data = wraps.map(w => JSON.parse(w.dataset.pts));
 const VBW = 760, VBH = 170;
 
+// The server has no idea which timezone the reader is in, so it sends seconds.
+const when = ts => new Date(ts * 1000).toLocaleString([], {
+  day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+});
+for (const label of document.querySelectorAll('.when')) {
+  label.textContent = when(+label.dataset.ts);
+}
+
 function hide() {
   for (const w of wraps) {
     w.querySelector('.cursor').style.display = 'none';
@@ -492,7 +500,7 @@ function show(i) {
   wraps.forEach((w, k) => {
     const p = data[k][i], cursor = w.querySelector('.cursor'), tip = w.querySelector('.tip');
     if (!p) { cursor.style.display = 'none'; tip.hidden = true; return; }
-    const [px, py, when, value] = p;
+    const [px, py, ts, value] = p;
     cursor.style.display = '';
     const line = cursor.querySelector('line');
     line.setAttribute('x1', px);
@@ -505,7 +513,7 @@ function show(i) {
     tip.hidden = false;
     tip.innerHTML = '<b></b><br><small></small>';
     tip.querySelector('b').textContent = value;
-    tip.querySelector('small').textContent = when;
+    tip.querySelector('small').textContent = when(ts);
     tip.style.left = (px / VBW * box.width) + 'px';
     tip.style.top = (py / VBH * box.height) + 'px';
     tip.classList.toggle('flip', px > VBW * 0.7);
