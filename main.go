@@ -59,14 +59,18 @@ const manifest = `{
 }`
 
 type stat struct {
-	Node     string  `json:"node"`
-	Service  string  `json:"service"`
-	Stack    string  `json:"stack"`
-	Slot     int     `json:"slot"`
-	CPU      float64 `json:"cpu"`
-	Mem      uint64  `json:"mem"`
-	MemLimit uint64  `json:"mem_limit"`
-	Err      string  `json:"err"`
+	Node       string  `json:"node"`
+	Service    string  `json:"service"`
+	Stack      string  `json:"stack"`
+	Slot       int     `json:"slot"`
+	CPU        float64 `json:"cpu"`
+	Mem        uint64  `json:"mem"`
+	MemLimit   uint64  `json:"mem_limit"`
+	NetRX      uint64  `json:"net_rx"`
+	NetTX      uint64  `json:"net_tx"`
+	BlockRead  uint64  `json:"block_read"`
+	BlockWrite uint64  `json:"block_write"`
+	Err        string  `json:"err"`
 }
 
 // ponytail: one row per service per tick, replicas summed at write time. Raw
@@ -81,6 +85,10 @@ CREATE TABLE IF NOT EXISTS samples (
   cpu       REAL    NOT NULL,
   mem       INTEGER NOT NULL,
   mem_limit INTEGER NOT NULL,
+  net_rx    INTEGER NOT NULL DEFAULT 0,
+  net_tx    INTEGER NOT NULL DEFAULT 0,
+  block_read  INTEGER NOT NULL DEFAULT 0,
+  block_write INTEGER NOT NULL DEFAULT 0,
   replicas  INTEGER NOT NULL,
   PRIMARY KEY (service, ts)
 ) WITHOUT ROWID;
@@ -93,6 +101,14 @@ func openDB(path string) (*sql.DB, error) {
 	}
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
+	}
+	for _, column := range []string{
+		"net_rx INTEGER NOT NULL DEFAULT 0", "net_tx INTEGER NOT NULL DEFAULT 0",
+		"block_read INTEGER NOT NULL DEFAULT 0", "block_write INTEGER NOT NULL DEFAULT 0",
+	} {
+		if _, err := db.Exec("ALTER TABLE samples ADD COLUMN " + column); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return nil, err
+		}
 	}
 	return db, nil
 }
@@ -175,9 +191,12 @@ func fetchStats() ([]stat, error) {
 // fell out of the retention window.
 func save(db *sql.DB, now time.Time, stats []stat) error {
 	type agg struct {
-		stack             string
-		cpu               float64
-		mem, limit, count uint64
+		stack                 string
+		cpu                   float64
+		mem, limit            uint64
+		netRX, netTX          uint64
+		blockRead, blockWrite uint64
+		count                 uint64
 	}
 	byService := map[string]*agg{}
 	for _, s := range stats {
@@ -191,6 +210,10 @@ func save(db *sql.DB, now time.Time, stats []stat) error {
 		}
 		a.cpu += s.CPU
 		a.mem += s.Mem
+		a.netRX += s.NetRX
+		a.netTX += s.NetTX
+		a.blockRead += s.BlockRead
+		a.blockWrite += s.BlockWrite
 		// The limit is per replica — summing it would claim a service with two
 		// unlimited replicas on one node may use that node's memory twice.
 		// ponytail: max, so replicas on unequal nodes read as the largest one.
@@ -205,13 +228,13 @@ func save(db *sql.DB, now time.Time, stats []stat) error {
 		return err
 	}
 	defer tx.Rollback()
-	ins, err := tx.Prepare(`INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?)`)
+	ins, err := tx.Prepare(`INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
 	ts := now.Unix()
 	for name, a := range byService {
-		if _, err := ins.Exec(ts, name, a.stack, a.cpu, a.mem, a.limit, a.count); err != nil {
+		if _, err := ins.Exec(ts, name, a.stack, a.cpu, a.mem, a.limit, a.netRX, a.netTX, a.blockRead, a.blockWrite, a.count); err != nil {
 			return err
 		}
 	}
@@ -288,6 +311,42 @@ func series(db *sql.DB, service string, from, to time.Time, buckets int) (cpu, m
 	return cpu, mem, rs.Err()
 }
 
+// counterSeries turns cumulative Docker counters into bytes per second. A
+// restarted container resets its counter; that interval is shown as zero.
+func counterSeries(db *sql.DB, service, column string, from, to time.Time, buckets int) ([]point, error) {
+	if column != "net_rx" && column != "net_tx" && column != "block_read" && column != "block_write" {
+		return nil, fmt.Errorf("unknown counter %q", column)
+	}
+	width := (to.Unix() - from.Unix()) / int64(buckets)
+	if width < 1 {
+		width = 1
+	}
+	rs, err := db.Query(`SELECT (ts/?)*? AS b, AVG(`+column+`)
+		FROM samples WHERE service = ? AND ts >= ? AND ts <= ?
+		GROUP BY b ORDER BY b`, width, width, service, from.Unix(), to.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rs.Close()
+	var out []point
+	var prev point
+	for rs.Next() {
+		var current point
+		if err := rs.Scan(&current.T, &current.V); err != nil {
+			return nil, err
+		}
+		if prev.T != 0 && current.T > prev.T {
+			v := (current.V - prev.V) / float64(current.T-prev.T)
+			if v < 0 {
+				v = 0
+			}
+			out = append(out, point{current.T, v})
+		}
+		prev = current
+	}
+	return out, rs.Err()
+}
+
 func since(sec int64) string {
 	switch {
 	case sec < 60:
@@ -317,6 +376,8 @@ func human(b float64) string {
 func humanU(b uint64) string { return human(float64(b)) }
 
 func pct(v float64) string { return fmt.Sprintf("%.1f %%", v) }
+
+func bytesPerSecond(v float64) string { return human(v) + "/s" }
 
 func round(v float64) float64 { return math.Round(v*10) / 10 }
 
@@ -474,9 +535,16 @@ var detail = template.Must(template.New("d").Parse(head + `
 {{.CPUChart}}
 <h2>Memory</h2>
 {{.MemChart}}
+<h2>Network receive</h2>
+{{.NetRXChart}}
+<h2>Network transmit</h2>
+{{.NetTXChart}}
+<h2>Block read</h2>
+{{.BlockReadChart}}
+<h2>Block write</h2>
+{{.BlockWriteChart}}
 <script>
-// Both charts share one time axis, so a hover on either moves the cursor on
-// both — reading CPU against memory at the same second is the whole point.
+// Every chart shares one time axis, so a hover compares every metric at once.
 const wraps = [...document.querySelectorAll('.chartwrap')];
 const data = wraps.map(w => JSON.parse(w.dataset.pts));
 const VBW = 760, VBH = 170;
@@ -491,15 +559,17 @@ for (const label of document.querySelectorAll('.when')) {
 
 function hide() {
   for (const w of wraps) {
-    w.querySelector('.cursor').style.display = 'none';
+    w.querySelector('.cursor')?.style.setProperty('display', 'none');
     w.querySelector('.tip').hidden = true;
   }
 }
 
-function show(i) {
+function show(targetTS) {
   wraps.forEach((w, k) => {
-    const p = data[k][i], cursor = w.querySelector('.cursor'), tip = w.querySelector('.tip');
-    if (!p) { cursor.style.display = 'none'; tip.hidden = true; return; }
+    const pts = data[k], cursor = w.querySelector('.cursor'), tip = w.querySelector('.tip');
+    if (!pts.length || !cursor) { tip.hidden = true; return; }
+    let p = pts[0];
+    for (const candidate of pts) if (Math.abs(candidate[2] - targetTS) < Math.abs(p[2] - targetTS)) p = candidate;
     const [px, py, ts, value] = p;
     cursor.style.display = '';
     const line = cursor.querySelector('line');
@@ -530,7 +600,7 @@ for (const [k, w] of wraps.entries()) {
     for (let i = 1; i < pts.length; i++) {
       if (Math.abs(pts[i][0] - vx) < Math.abs(pts[best][0] - vx)) best = i;
     }
-    show(best);
+    show(pts[best][2]);
   });
   w.addEventListener('mouseleave', hide);
 }
@@ -545,7 +615,7 @@ func overviewPage(w http.ResponseWriter, db *sql.DB, r *http.Request) {
 	}
 	warn := ""
 	if creds.Load() == nil {
-		warn = "No token yet — sampling starts with the first request the panel proxies here."
+		warn = "No token yet - waiting for the core to fetch /manifest."
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	overview.Execute(w, struct {
@@ -568,13 +638,37 @@ func servicePage(w http.ResponseWriter, db *sql.DB, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	netRX, err := counterSeries(db, name, "net_rx", from, to, 180)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	netTX, err := counterSeries(db, name, "net_tx", from, to, 180)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	blockRead, err := counterSeries(db, name, "block_read", from, to, 180)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	blockWrite, err := counterSeries(db, name, "block_write", from, to, 180)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	detail.Execute(w, struct {
-		Service            string
-		Range              string
-		Ranges             any
-		CPUChart, MemChart template.HTML
+		Service                                                                     string
+		Range                                                                       string
+		Ranges                                                                      any
+		CPUChart, MemChart, NetRXChart, NetTXChart, BlockReadChart, BlockWriteChart template.HTML
 	}{name, label, ranges,
 		chart(cpu, from, to, pct, "cpu"),
-		chart(mem, from, to, human, "mem")})
+		chart(mem, from, to, human, "mem"),
+		chart(netRX, from, to, bytesPerSecond, "net-rx"),
+		chart(netTX, from, to, bytesPerSecond, "net-tx"),
+		chart(blockRead, from, to, bytesPerSecond, "block-read"),
+		chart(blockWrite, from, to, bytesPerSecond, "block-write")})
 }

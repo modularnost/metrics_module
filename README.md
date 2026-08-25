@@ -1,6 +1,6 @@
 # metrics_module
 
-CPU and memory history for the
+CPU, memory, network traffic and block I/O history for the
 [modularnost](https://github.com/modularnost/panel) panel: sampled from the
 core, kept in SQLite, drawn as SVG. Permission: `stats:read`.
 
@@ -36,9 +36,10 @@ with a new `PANEL_MODULE_SECRET`. Needs a core new enough to do that.
 
 ## What it keeps
 
-One row per service per tick: CPU and memory summed across replicas, the memory
-limit per replica, the replica count. At 30s that is ~2900 rows per service per
-day. Charts bucket the range into <=180 points in SQL.
+One row per service per tick: CPU, memory and cumulative traffic/I/O summed
+across replicas, memory limit per replica, replica count. Traffic and I/O
+graphs calculate bytes/s from adjacent samples. At 30s that is ~2900 rows per
+service per day. Charts bucket the range into <=180 points in SQL.
 
 No per-replica or per-node history, no alerting, no downsampling into hourly
 rows — add that when a retention window longer than a week is wanted.
