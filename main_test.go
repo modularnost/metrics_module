@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -99,5 +102,66 @@ func TestChart(t *testing.T) {
 	}
 	if empty := string(chart(nil, from, to, pct, "cpu")); !strings.Contains(empty, "no samples") || !strings.Contains(empty, `data-pts="[]"`) {
 		t.Errorf("empty chart should say so: %s", empty)
+	}
+}
+
+func TestManifestIsContractOneWithAServiceTab(t *testing.T) {
+	var m struct {
+		Contract      int `json:"contract"`
+		Contributions []struct {
+			Slot, Path, Role string
+		} `json:"contributions"`
+		Permissions []string `json:"permissions"`
+	}
+	if err := json.Unmarshal([]byte(manifest), &m); err != nil {
+		t.Fatal(err)
+	}
+	slots := map[string]string{}
+	for _, c := range m.Contributions {
+		slots[c.Slot] = c.Path
+		if c.Role != "viewer" {
+			t.Errorf("%s: the numbers are what the panel shows a viewer, got role %q", c.Slot, c.Role)
+		}
+	}
+	if m.Contract != 1 || slots["nav"] != "/" || slots["service.tab"] != "/service" || len(m.Permissions) != 1 {
+		t.Fatalf("%+v", m)
+	}
+}
+
+func TestServicePageAsATabHasNoWayOutOfTheService(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/m.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	page := func(query string) string {
+		rec := httptest.NewRecorder()
+		servicePage(rec, db, httptest.NewRequest("GET", "/service?"+query, nil))
+		if rec.Code != 200 {
+			t.Fatalf("%s: %d %s", query, rec.Code, rec.Body)
+		}
+		return rec.Body.String()
+	}
+
+	// The panel's tab: told the service as ?service=, shown inside a service.
+	tab := page("service=api&id=abc&stack=shop")
+	if strings.Contains(tab, "all services") || strings.Contains(tab, "<h1>api</h1>") {
+		t.Error("a tab must not repeat the service's heading or link out to the overview")
+	}
+	if !strings.Contains(tab, "service?service=api&amp;range=") {
+		t.Error("the range links must keep telling the page which service it is")
+	}
+
+	// Our own overview link: a page of its own.
+	own := page("name=api")
+	if !strings.Contains(own, "all services") || !strings.Contains(own, "<h1>api</h1>") || !strings.Contains(own, "service?name=api&amp;range=") {
+		t.Error("the standalone page lost its heading, its way back or its range links")
+	}
+
+	rec := httptest.NewRecorder()
+	servicePage(rec, db, httptest.NewRequest("GET", "/service", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("no service at all: %d", rec.Code)
 	}
 }
