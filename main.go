@@ -1,20 +1,21 @@
 // A metrics history module for the modularnost panel: it polls the core's
-// /internal/stats, keeps the numbers in SQLite and draws them.
+// /internal/stats, keeps the numbers in SQLite and sends them as pages of
+// blocks (a table, charts) that the panel draws.
 //
-// The core deliberately keeps no history (architecture.md, ADR 5) — that is
+// The core deliberately keeps no history (architecture.md, ADR 5) вЂ” that is
 // this module's whole reason to exist. It has no docker.sock of its own; every
 // number here came from GET /internal/stats with the stats:read permission.
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"io"
 	"log"
-	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -51,16 +52,16 @@ func dur(v string, def time.Duration) time.Duration {
 	return d
 }
 
-// Contract 1 of the panel (docs/modules.md there): the menu entry, and a tab on
-// every service's page. Viewers may see the numbers: the panel's own Resources
-// page shows them to a viewer too.
+// Contract 2 of the panel (docs/modules.md there): the menu entry, and a tab on
+// every service's page, both pages of blocks the panel draws. Viewers may see
+// the numbers: the panel's own Resources page shows them to a viewer too.
 const manifest = `{
-  "contract": 1,
+  "contract": 2,
   "name": "metrics",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "contributions": [
-    {"slot": "nav", "title": "Metrics", "path": "/", "role": "viewer"},
-    {"slot": "service.tab", "title": "Metrics", "path": "/service", "role": "viewer"}
+    {"slot": "nav", "title": "Metrics", "path": "/", "role": "viewer", "render": "ui"},
+    {"slot": "service.tab", "title": "Metrics", "path": "/service", "role": "viewer", "render": "ui"}
   ],
   "permissions": ["stats:read"]
 }`
@@ -82,7 +83,7 @@ type stat struct {
 
 // ponytail: one row per service per tick, replicas summed at write time. Raw
 // per-replica history would multiply the rows by the replica count to answer
-// "which replica is hot" — which the panel's own Resources page already does.
+// "which replica is hot" вЂ” which the panel's own Resources page already does.
 // Add downsampling into hourly rows when the retention window outgrows a week.
 const schema = `
 CREATE TABLE IF NOT EXISTS samples (
@@ -141,7 +142,7 @@ func main() {
 		remember(r)
 		servicePage(w, db, r)
 	})
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
 		remember(r)
 		overviewPage(w, db, r)
 	})
@@ -166,6 +167,13 @@ func sampler(db *sql.DB) {
 		}
 		if err := save(db, time.Now(), stats); err != nil {
 			log.Printf("sample not stored: %v", err)
+			continue
+		}
+		// Nobody polls: the browsers that have a page open ask again when told.
+		for _, page := range []string{"/", "/service"} {
+			if err := changed(page); err != nil {
+				log.Printf("telling the panel about %s: %v", page, err)
+			}
 		}
 	}
 }
@@ -221,7 +229,7 @@ func save(db *sql.DB, now time.Time, stats []stat) error {
 		a.netTX += s.NetTX
 		a.blockRead += s.BlockRead
 		a.blockWrite += s.BlockWrite
-		// The limit is per replica — summing it would claim a service with two
+		// The limit is per replica вЂ” summing it would claim a service with two
 		// unlimited replicas on one node may use that node's memory twice.
 		// ponytail: max, so replicas on unequal nodes read as the largest one.
 		if s.MemLimit > a.limit {
@@ -382,91 +390,6 @@ func human(b float64) string {
 
 func humanU(b uint64) string { return human(float64(b)) }
 
-func pct(v float64) string { return fmt.Sprintf("%.1f %%", v) }
-
-func bytesPerSecond(v float64) string { return human(v) + "/s" }
-
-func round(v float64) float64 { return math.Round(v*10) / 10 }
-
-// figure wraps a chart in the element the hover script drives: the points it
-// snaps to travel in the markup, so the page needs no request to answer a hover.
-func figure(svg, marks string) template.HTML {
-	return template.HTML(fmt.Sprintf(`<figure class="chartwrap" data-pts="%s">%s<div class="tip" hidden></div></figure>`,
-		template.HTMLEscapeString(marks), svg))
-}
-
-// chart draws one line over a fixed time window. Server-rendered SVG: a chart
-// library would be a dependency and a build step for what is one polyline.
-func chart(pts []point, from, to time.Time, label func(float64) string, class string) template.HTML {
-	const w, h = 760.0, 170.0
-	const padL, padR, padT, padB = 62.0, 8.0, 10.0, 20.0
-	plotW, plotH := w-padL-padR, h-padT-padB
-
-	max := 0.0
-	for _, p := range pts {
-		if p.V > max {
-			max = p.V
-		}
-	}
-	if max <= 0 {
-		max = 1
-	}
-	max *= 1.15 // headroom, so the peak is not glued to the frame
-
-	span := float64(to.Unix() - from.Unix())
-	x := func(t int64) float64 {
-		if span <= 0 {
-			return padL
-		}
-		return padL + plotW*float64(t-from.Unix())/span
-	}
-	y := func(v float64) float64 { return padT + plotH*(1-v/max) }
-
-	var b strings.Builder
-	fmt.Fprintf(&b, `<svg class="chart %s" viewBox="0 0 %.0f %.0f" preserveAspectRatio="none" role="img">`, class, w, h)
-	for i := 0; i <= 2; i++ {
-		v := max * float64(i) / 2
-		gy := y(v)
-		fmt.Fprintf(&b, `<line class="grid" x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f"/>`, padL, gy, w-padR, gy)
-		fmt.Fprintf(&b, `<text class="tick" x="%.1f" y="%.1f" text-anchor="end">%s</text>`, padL-6, gy+4, template.HTMLEscapeString(label(v)))
-	}
-	// Times carry as unix seconds and are formatted by the browser: the module
-	// runs in whatever timezone its container has, the reader does not.
-	for i, t := range []time.Time{from, from.Add(to.Sub(from) / 2), to} {
-		anchor := [...]string{"start", "middle", "end"}[i]
-		fmt.Fprintf(&b, `<text class="tick when" data-ts="%d" x="%.1f" y="%.1f" text-anchor="%s">%s</text>`,
-			t.Unix(), x(t.Unix()), h-6, anchor, t.UTC().Format("02.01 15:04 UTC"))
-	}
-	if len(pts) == 0 {
-		fmt.Fprintf(&b, `<text class="tick" x="%.1f" y="%.1f" text-anchor="middle">no samples in this range</text>`, w/2, h/2)
-		b.WriteString(`</svg>`)
-		return figure(b.String(), "[]")
-	}
-	var line, area strings.Builder
-	for i, p := range pts {
-		cmd := "L"
-		if i == 0 {
-			cmd = "M"
-			fmt.Fprintf(&area, "M%.1f,%.1f", x(p.T), y(0))
-		}
-		fmt.Fprintf(&line, "%s%.1f,%.1f", cmd, x(p.T), y(p.V))
-		fmt.Fprintf(&area, "L%.1f,%.1f", x(p.T), y(p.V))
-	}
-	fmt.Fprintf(&area, "L%.1f,%.1fZ", x(pts[len(pts)-1].T), y(0))
-	fmt.Fprintf(&b, `<path class="area" d="%s"/><path class="line" d="%s"/>`, area.String(), line.String())
-	fmt.Fprintf(&b, `<g class="cursor" style="display:none"><line y1="%.1f" y2="%.1f"/><circle r="3.5"/></g>`, padT, padT+plotH)
-	b.WriteString(`</svg>`)
-
-	// The hover script needs the points where they are drawn, the value already
-	// formatted (no second implementation of human() in JS) and the raw time.
-	marks := make([][4]any, len(pts))
-	for i, p := range pts {
-		marks[i] = [4]any{round(x(p.T)), round(y(p.V)), p.T, label(p.V)}
-	}
-	js, _ := json.Marshal(marks)
-	return figure(b.String(), string(js))
-}
-
 var ranges = []struct {
 	Label string
 	D     time.Duration
@@ -486,135 +409,88 @@ func rangeOf(s string) (string, time.Duration) {
 	return "6h", 6 * time.Hour
 }
 
-const head = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Metrics</title>
-<link rel="stylesheet" href="/static/panel.css">
-<style>
-body { margin: 1rem; }
-.chart { width: 100%; height: 170px; display: block; }
-.chart .grid { stroke: currentColor; opacity: .18; }
-.chart .tick { fill: currentColor; opacity: .6; font-size: 11px; }
-.chart .line { fill: none; stroke: var(--accent, #4a90d9); stroke-width: 2; vector-effect: non-scaling-stroke; }
-.chart .area { fill: var(--accent, #4a90d9); opacity: .12; }
-.chart .cursor line { stroke: currentColor; opacity: .45; stroke-width: 1; vector-effect: non-scaling-stroke; }
-.chart .cursor circle { fill: var(--accent, #4a90d9); }
-.chart.mem .cursor circle { fill: #6ab04c; }
-.chartwrap { position: relative; margin: 0 0 1rem; }
-.tip { position: absolute; z-index: 2; pointer-events: none; white-space: nowrap;
-  padding: .25rem .45rem; border-radius: 4px; font-size: 12px; line-height: 1.3;
-  background: #000c; color: #fff; transform: translate(10px, -50%); }
-.tip.flip { transform: translate(calc(-100% - 10px), -50%); }
-.tip small { opacity: .7; }
-.chart.mem .line { stroke: #6ab04c; }
-.chart.mem .area { fill: #6ab04c; }
-.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.tabs a { margin-right: .5rem; }
-.tabs a.on { font-weight: 600; text-decoration: underline; }
-</style></head><body>`
+// A page is a document of blocks the panel draws (docs/modules.md there); this
+// module sends numbers and units, and the panel formats them.
+type block map[string]any
 
-var overview = template.Must(template.New("o").Funcs(template.FuncMap{"human": humanU, "pct": pct}).Parse(head + `
-<h1>Metrics</h1>
-{{if .Warn}}<p class="bad">{{.Warn}}</p>{{end}}
-<table>
-<tr><th>Service</th><th>Stack</th><th class=num>Replicas</th><th class=num>CPU</th><th class=num>Memory</th><th>Sampled</th></tr>
-{{range .Rows}}
-<tr>
-  <td><a href="/modules/metrics/service?name={{.Service}}">{{.Service}}</a></td>
-  <td class=muted>{{.Stack}}</td>
-  <td class=num>{{.Replicas}}</td>
-  <td class=num>{{pct .CPU}}</td>
-  <td class=num>{{human .Mem}}{{if .MemLimit}} / {{if gt .Replicas 1}}{{.Replicas}} &times; {{end}}{{human .MemLimit}}{{end}}</td>
-  <td class=muted>{{.Age}}</td>
-</tr>
-{{else}}
-<tr><td colspan=6>Nothing sampled yet.</td></tr>
-{{end}}
-</table>
-<script>setTimeout(() => location.reload(), 30000);</script>
-</body></html>`))
-
-var detail = template.Must(template.New("d").Parse(head + `
-{{if not .Tab}}<h1>{{.Service}}</h1>{{end}}
-<p class=tabs>
-{{if not .Tab}}<a href="/modules/metrics/">&larr; all services</a>{{end}}
-{{range .Ranges}}<a class="{{if eq .Label $.Range}}on{{end}}" href="/modules/metrics/service?{{$.Param}}={{$.Service}}&amp;range={{.Label}}">{{.Label}}</a>{{end}}
-</p>
-<h2>CPU, % of one core</h2>
-{{.CPUChart}}
-<h2>Memory</h2>
-{{.MemChart}}
-<h2>Network receive</h2>
-{{.NetRXChart}}
-<h2>Network transmit</h2>
-{{.NetTXChart}}
-<h2>Block read</h2>
-{{.BlockReadChart}}
-<h2>Block write</h2>
-{{.BlockWriteChart}}
-<script>
-// Every chart shares one time axis, so a hover compares every metric at once.
-const wraps = [...document.querySelectorAll('.chartwrap')];
-const data = wraps.map(w => JSON.parse(w.dataset.pts));
-const VBW = 760, VBH = 170;
-
-// The server has no idea which timezone the reader is in, so it sends seconds.
-const when = ts => new Date(ts * 1000).toLocaleString([], {
-  day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
-});
-for (const label of document.querySelectorAll('.when')) {
-  label.textContent = when(+label.dataset.ts);
+type document struct {
+	UI     int     `json:"ui"`
+	Blocks []block `json:"blocks"`
 }
 
-function hide() {
-  for (const w of wraps) {
-    w.querySelector('.cursor')?.style.setProperty('display', 'none');
-    w.querySelector('.tip').hidden = true;
-  }
+func write(w http.ResponseWriter, d document) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(d)
 }
 
-function show(targetTS) {
-  wraps.forEach((w, k) => {
-    const pts = data[k], cursor = w.querySelector('.cursor'), tip = w.querySelector('.tip');
-    if (!pts.length || !cursor) { tip.hidden = true; return; }
-    let p = pts[0];
-    for (const candidate of pts) if (Math.abs(candidate[2] - targetTS) < Math.abs(p[2] - targetTS)) p = candidate;
-    const [px, py, ts, value] = p;
-    cursor.style.display = '';
-    const line = cursor.querySelector('line');
-    line.setAttribute('x1', px);
-    line.setAttribute('x2', px);
-    const dot = cursor.querySelector('circle');
-    dot.setAttribute('cx', px);
-    dot.setAttribute('cy', py);
-
-    const box = w.getBoundingClientRect();
-    tip.hidden = false;
-    tip.innerHTML = '<b></b><br><small></small>';
-    tip.querySelector('b').textContent = value;
-    tip.querySelector('small').textContent = when(ts);
-    tip.style.left = (px / VBW * box.width) + 'px';
-    tip.style.top = (py / VBH * box.height) + 'px';
-    tip.classList.toggle('flip', px > VBW * 0.7);
-  });
+// changed tells the panel that a page of ours is different now.
+func changed(page string) error {
+	c := creds.Load()
+	if c == nil {
+		return fmt.Errorf("no token yet")
+	}
+	req, err := http.NewRequest(http.MethodPost, core+"/internal/ui/changed", bytes.NewBufferString(fmt.Sprintf(`{"path":%q}`, page)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Panel-Module", c[0])
+	req.Header.Set("X-Panel-Token", c[1])
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("%s", resp.Status)
+	}
+	return nil
 }
 
-for (const [k, w] of wraps.entries()) {
-  w.addEventListener('mousemove', e => {
-    const pts = data[k];
-    if (!pts.length) return;
-    const box = w.getBoundingClientRect();
-    const vx = (e.clientX - box.left) / box.width * VBW;
-    let best = 0;
-    for (let i = 1; i < pts.length; i++) {
-      if (Math.abs(pts[i][0] - vx) < Math.abs(pts[best][0] - vx)) best = i;
-    }
-    show(pts[best][2]);
-  });
-  w.addEventListener('mouseleave', hide);
+func overviewDoc(rows []row, warn string) document {
+	var cpu float64
+	var mem uint64
+	table := make([]block, 0, len(rows))
+	for _, r := range rows {
+		cpu += r.CPU
+		mem += r.Mem
+		memory := humanU(r.Mem)
+		if r.MemLimit > 0 {
+			memory += " / "
+			if r.Replicas > 1 {
+				memory += fmt.Sprintf("%d × ", r.Replicas)
+			}
+			memory += humanU(r.MemLimit)
+		}
+		table = append(table, block{
+			"service":  block{"text": r.Service, "href": block{"path": "/service?name=" + url.QueryEscape(r.Service)}},
+			"stack":    r.Stack,
+			"replicas": r.Replicas,
+			"cpu":      r.CPU,
+			"memory":   memory,
+			"sampled":  r.Age,
+		})
+	}
+	blocks := []block{}
+	if warn != "" {
+		blocks = append(blocks, block{"type": "banner", "tone": "warning", "text": warn})
+	}
+	return document{UI: 1, Blocks: append(blocks,
+		block{"type": "stat", "label": "Services", "value": len(rows)},
+		block{"type": "stat", "label": "CPU", "value": cpu, "unit": "percent"},
+		block{"type": "stat", "label": "Memory", "value": mem, "unit": "bytes"},
+		block{"type": "table", "empty": "Nothing sampled yet.", "rows": table, "columns": []block{
+			{"key": "service", "title": "Service"},
+			{"key": "stack", "title": "Stack"},
+			{"key": "replicas", "title": "Replicas", "type": "number"},
+			{"key": "cpu", "title": "CPU", "type": "percent"},
+			{"key": "memory", "title": "Memory", "align": "right"},
+			{"key": "sampled", "title": "Sampled"},
+		}},
+	)}
 }
-</script>
-</body></html>`))
 
-func overviewPage(w http.ResponseWriter, db *sql.DB, r *http.Request) {
+func overviewPage(w http.ResponseWriter, db *sql.DB, _ *http.Request) {
 	rows, err := latest(db, time.Now())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -622,13 +498,9 @@ func overviewPage(w http.ResponseWriter, db *sql.DB, r *http.Request) {
 	}
 	warn := ""
 	if creds.Load() == nil {
-		warn = "No token yet - waiting for the core to fetch /manifest."
+		warn = "No token yet: waiting for the core to fetch /manifest."
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	overview.Execute(w, struct {
-		Rows []row
-		Warn string
-	}{rows, warn})
+	write(w, overviewDoc(rows, warn))
 }
 
 // serviceOf is the service a request asks about, and whether the page is a tab
@@ -640,57 +512,63 @@ func serviceOf(r *http.Request) (name string, tab bool) {
 	return r.URL.Query().Get("name"), false
 }
 
+func points(in []point) [][2]float64 {
+	out := make([][2]float64, len(in))
+	for i, p := range in {
+		out[i] = [2]float64{float64(p.T), p.V}
+	}
+	return out
+}
+
+// serviceDoc is one service's history: a range to pick, and a chart per number.
+// They share one time axis, so a hover compares every metric at once. A tab
+// does not repeat the service's name or link out of it, the panel already does.
+func serviceDoc(db *sql.DB, name string, tab bool, rangeLabel string, now time.Time) (document, error) {
+	label, d := rangeOf(rangeLabel)
+	from := now.Add(-d)
+	const buckets = 180
+
+	cpu, mem, err := series(db, name, from, now, buckets)
+	if err != nil {
+		return document{}, err
+	}
+	chart := func(title, unit string, pts []point) block {
+		return block{"type": "chart", "title": title, "unit": unit, "sync": "time", "from": from.Unix(), "to": now.Unix(),
+			"empty": "No samples in this range.", "series": []block{{"name": title, "points": points(pts)}}}
+	}
+	charts := []block{chart("CPU, % of one core", "percent", cpu), chart("Memory", "bytes", mem)}
+	for _, c := range []struct{ title, column string }{
+		{"Network receive", "net_rx"}, {"Network transmit", "net_tx"}, {"Block read", "block_read"}, {"Block write", "block_write"},
+	} {
+		pts, err := counterSeries(db, name, c.column, from, now, buckets)
+		if err != nil {
+			return document{}, err
+		}
+		charts = append(charts, chart(c.title, "bytes/s", pts))
+	}
+
+	options := make([]block, len(ranges))
+	for i, r := range ranges {
+		options[i] = block{"value": r.Label, "label": r.Label}
+	}
+	blocks := []block{}
+	if !tab {
+		blocks = append(blocks, block{"type": "link", "text": "All services", "href": block{"path": "/"}}, block{"type": "heading", "level": 1, "text": name})
+	}
+	blocks = append(blocks, block{"type": "choice", "param": "range", "value": label, "options": options})
+	return document{UI: 1, Blocks: append(blocks, charts...)}, nil
+}
+
 func servicePage(w http.ResponseWriter, db *sql.DB, r *http.Request) {
 	name, tab := serviceOf(r)
 	if name == "" {
-		http.Error(w, "name is required", http.StatusBadRequest)
+		write(w, document{UI: 1, Blocks: []block{{"type": "banner", "tone": "warning", "text": "Open a service from the list to see its history."}}})
 		return
 	}
-	label, d := rangeOf(r.URL.Query().Get("range"))
-	to := time.Now()
-	from := to.Add(-d)
-	cpu, mem, err := series(db, name, from, to, 180)
+	doc, err := serviceDoc(db, name, tab, r.URL.Query().Get("range"), time.Now())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	netRX, err := counterSeries(db, name, "net_rx", from, to, 180)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	netTX, err := counterSeries(db, name, "net_tx", from, to, 180)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	blockRead, err := counterSeries(db, name, "block_read", from, to, 180)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	blockWrite, err := counterSeries(db, name, "block_write", from, to, 180)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	param := "name"
-	if tab {
-		param = "service"
-	}
-	detail.Execute(w, struct {
-		Service                                                                     string
-		Tab                                                                         bool
-		Param                                                                       string
-		Range                                                                       string
-		Ranges                                                                      any
-		CPUChart, MemChart, NetRXChart, NetTXChart, BlockReadChart, BlockWriteChart template.HTML
-	}{name, tab, param, label, ranges,
-		chart(cpu, from, to, pct, "cpu"),
-		chart(mem, from, to, human, "mem"),
-		chart(netRX, from, to, bytesPerSecond, "net-rx"),
-		chart(netTX, from, to, bytesPerSecond, "net-tx"),
-		chart(blockRead, from, to, bytesPerSecond, "block-read"),
-		chart(blockWrite, from, to, bytesPerSecond, "block-write")})
+	write(w, doc)
 }

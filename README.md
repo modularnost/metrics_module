@@ -2,12 +2,17 @@
 
 CPU, memory, network traffic and block I/O history for the
 [modularnost](https://github.com/modularnost/panel) panel: sampled from the
-core, kept in SQLite, drawn as SVG. Permission: `stats:read`.
+core, kept in SQLite, sent as charts the panel draws. Permission: `stats:read`.
 
 It adds a **Metrics** entry to the menu and a **Metrics** tab to every
-service's page. Needs panel **v0.3.0** or newer, the first release that reads a
-`contract` 1 manifest; an older panel loads the module without the menu entry
-and without the tab.
+service's page. Both are pages of blocks (a table, a chart per number, a range
+to pick) that the panel draws in its own look, theme and phone layout; the
+module sends numbers and units, not HTML. After every sample it tells the panel,
+and an open page updates by itself.
+
+Needs a panel that reads a `contract` 2 manifest: `edge` until the release after
+v0.3.0. A panel of contract 1 shows the module as failed, and `0.2.0` of the
+module is the last one for it.
 
 ## Install
 
@@ -17,7 +22,7 @@ main, `sha-<commit>` pinned.
 ```sh
 docker volume create metrics_data
 
-docker service create --name metrics_module   --network panelnet   --label panel.module=true   --label panel.module.name=metrics   --label panel.module.version=0.2.0   --mount type=volume,source=metrics_data,target=/data   --constraint node.role==manager   --env PANEL_CORE_URL=http://panel:8080   ghcr.io/modularnost/metrics-module:latest
+docker service create --name metrics_module   --network panelnet   --label panel.module=true   --label panel.module.name=metrics   --label panel.module.version=0.3.0   --mount type=volume,source=metrics_data,target=/data   --constraint node.role==manager   --env PANEL_CORE_URL=http://panel:8080   ghcr.io/modularnost/metrics-module:latest
 ```
 
 The volume holds the history, so it must stay on one node — pin a hostname if
