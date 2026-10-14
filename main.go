@@ -51,10 +51,17 @@ func dur(v string, def time.Duration) time.Duration {
 	return d
 }
 
+// Contract 1 of the panel (docs/modules.md there): the menu entry, and a tab on
+// every service's page. Viewers may see the numbers: the panel's own Resources
+// page shows them to a viewer too.
 const manifest = `{
+  "contract": 1,
   "name": "metrics",
-  "version": "0.1.0",
-  "nav_entries": [{"title": "Metrics", "path": "/"}],
+  "version": "0.2.0",
+  "contributions": [
+    {"slot": "nav", "title": "Metrics", "path": "/", "role": "viewer"},
+    {"slot": "service.tab", "title": "Metrics", "path": "/service", "role": "viewer"}
+  ],
   "permissions": ["stats:read"]
 }`
 
@@ -526,10 +533,10 @@ var overview = template.Must(template.New("o").Funcs(template.FuncMap{"human": h
 </body></html>`))
 
 var detail = template.Must(template.New("d").Parse(head + `
-<h1>{{.Service}}</h1>
+{{if not .Tab}}<h1>{{.Service}}</h1>{{end}}
 <p class=tabs>
-<a href="/modules/metrics/">&larr; all services</a>
-{{range .Ranges}}<a class="{{if eq .Label $.Range}}on{{end}}" href="/modules/metrics/service?name={{$.Service}}&amp;range={{.Label}}">{{.Label}}</a>{{end}}
+{{if not .Tab}}<a href="/modules/metrics/">&larr; all services</a>{{end}}
+{{range .Ranges}}<a class="{{if eq .Label $.Range}}on{{end}}" href="/modules/metrics/service?{{$.Param}}={{$.Service}}&amp;range={{.Label}}">{{.Label}}</a>{{end}}
 </p>
 <h2>CPU, % of one core</h2>
 {{.CPUChart}}
@@ -624,8 +631,17 @@ func overviewPage(w http.ResponseWriter, db *sql.DB, r *http.Request) {
 	}{rows, warn})
 }
 
+// serviceOf is the service a request asks about, and whether the page is a tab
+// on that service: the panel passes ?service= to a tab, our own links use ?name=.
+func serviceOf(r *http.Request) (name string, tab bool) {
+	if name = r.URL.Query().Get("service"); name != "" {
+		return name, true
+	}
+	return r.URL.Query().Get("name"), false
+}
+
 func servicePage(w http.ResponseWriter, db *sql.DB, r *http.Request) {
-	name := r.URL.Query().Get("name")
+	name, tab := serviceOf(r)
 	if name == "" {
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
@@ -659,12 +675,18 @@ func servicePage(w http.ResponseWriter, db *sql.DB, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	param := "name"
+	if tab {
+		param = "service"
+	}
 	detail.Execute(w, struct {
 		Service                                                                     string
+		Tab                                                                         bool
+		Param                                                                       string
 		Range                                                                       string
 		Ranges                                                                      any
 		CPUChart, MemChart, NetRXChart, NetTXChart, BlockReadChart, BlockWriteChart template.HTML
-	}{name, label, ranges,
+	}{name, tab, param, label, ranges,
 		chart(cpu, from, to, pct, "cpu"),
 		chart(mem, from, to, human, "mem"),
 		chart(netRX, from, to, bytesPerSecond, "net-rx"),
