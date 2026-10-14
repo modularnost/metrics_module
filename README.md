@@ -5,8 +5,9 @@ CPU, memory, network traffic and block I/O history for the
 core, kept in SQLite, drawn as SVG. Permission: `stats:read`.
 
 It adds a **Metrics** entry to the menu and a **Metrics** tab to every
-service's page. Needs panel **v0.2.0** or newer: that is the release that reads
-the manifest below (`contract` 1). An older panel shows the module as broken.
+service's page. Needs panel **v0.3.0** or newer, the first release that reads a
+`contract` 1 manifest; an older panel loads the module without the menu entry
+and without the tab.
 
 ## Install
 
