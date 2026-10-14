@@ -1,11 +1,9 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
-	"fmt"
-	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 )
@@ -75,41 +73,11 @@ func TestSaveAndSeries(t *testing.T) {
 	}
 }
 
-func TestChart(t *testing.T) {
-	to := time.Now()
-	from := to.Add(-time.Hour)
-	svg := string(chart([]point{{from.Unix(), 0}, {to.Unix(), 50}}, from, to, pct, "cpu"))
-	if !strings.Contains(svg, `class="line"`) || !strings.Contains(svg, "57.5 %") {
-		t.Errorf("no line or no axis label with headroom: %s", svg)
-	}
-	// The hover script snaps to these: one entry per point, x/y in viewBox
-	// units, with the label already formatted.
-	pts := svg[strings.Index(svg, `data-pts="`)+10:]
-	pts = pts[:strings.Index(pts, `"`)]
-	if !strings.Contains(pts, "50.0 %") || strings.Count(pts, "],[") != 1 {
-		t.Errorf("hover data wrong: %s", pts)
-	}
-	// Times travel as unix seconds; the browser formats them in the reader's
-	// timezone, which the module cannot know.
-	if !strings.Contains(pts, fmt.Sprint(to.Unix())) {
-		t.Errorf("hover data has no raw timestamp: %s", pts)
-	}
-	if !strings.Contains(svg, fmt.Sprintf(`data-ts="%d"`, from.Unix())) {
-		t.Errorf("axis label has no raw timestamp: %s", svg)
-	}
-	if !strings.Contains(svg, `class="cursor"`) {
-		t.Errorf("no crosshair: %s", svg)
-	}
-	if empty := string(chart(nil, from, to, pct, "cpu")); !strings.Contains(empty, "no samples") || !strings.Contains(empty, `data-pts="[]"`) {
-		t.Errorf("empty chart should say so: %s", empty)
-	}
-}
-
-func TestManifestIsContractOneWithAServiceTab(t *testing.T) {
+func TestManifestIsContractTwoWithTwoPagesOfBlocks(t *testing.T) {
 	var m struct {
 		Contract      int `json:"contract"`
 		Contributions []struct {
-			Slot, Path, Role string
+			Slot, Path, Role, Render string
 		} `json:"contributions"`
 		Permissions []string `json:"permissions"`
 	}
@@ -122,46 +90,131 @@ func TestManifestIsContractOneWithAServiceTab(t *testing.T) {
 		if c.Role != "viewer" {
 			t.Errorf("%s: the numbers are what the panel shows a viewer, got role %q", c.Slot, c.Role)
 		}
+		if c.Render != "ui" {
+			t.Errorf("%s: a page of blocks, not a frame: %q", c.Slot, c.Render)
+		}
 	}
-	if m.Contract != 1 || slots["nav"] != "/" || slots["service.tab"] != "/service" || len(m.Permissions) != 1 {
+	if m.Contract != 2 || slots["nav"] != "/" || slots["service.tab"] != "/service" || len(m.Permissions) != 1 {
 		t.Fatalf("%+v", m)
 	}
 }
 
-func TestServicePageAsATabHasNoWayOutOfTheService(t *testing.T) {
+func seeded(t *testing.T) (*sql.DB, time.Time) {
+	t.Helper()
 	db, err := openDB(t.TempDir() + "/m.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	t.Cleanup(func() { db.Close() })
+	now := time.Now()
+	for i := range 3 {
+		s := []stat{{Node: "n1", Service: "api", Stack: "shop", Slot: 1, CPU: float64(i), Mem: 100, MemLimit: 1000, NetRX: uint64(100 * i)},
+			{Node: "n2", Service: "api", Stack: "shop", Slot: 2, CPU: 1, Mem: 50, MemLimit: 1000}}
+		if err := save(db, now.Add(-time.Duration(2-i)*time.Minute), s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return db, now
+}
 
-	page := func(query string) string {
+func TestOverviewIsATableOfServicesWithLinksIntoTheModule(t *testing.T) {
+	db, now := seeded(t)
+	rows, err := latest(db, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := overviewDoc(rows, "")
+	var table block
+	for _, b := range d.Blocks {
+		if b["type"] == "table" {
+			table = b
+		}
+	}
+	r := table["rows"].([]block)
+	if len(r) != 1 || r[0]["replicas"] != 2 || r[0]["memory"] != "150 B / 2 × 1000 B" {
+		t.Fatalf("%+v", r)
+	}
+	if href := r[0]["service"].(block)["href"].(block); href["path"] != "/service?name=api" {
+		t.Errorf("a link must open the service page: %+v", href)
+	}
+	if d.Blocks[0]["type"] != "stat" {
+		t.Errorf("no banner while the token is known: %+v", d.Blocks[0])
+	}
+	if w := overviewDoc(nil, "No token yet"); w.Blocks[0]["type"] != "banner" {
+		t.Errorf("a missing token is said first: %+v", w.Blocks[0])
+	}
+}
+
+func TestServiceDocumentHasAChartPerNumberOnOneAxisAndAPageOfItsOwnWithAWayBack(t *testing.T) {
+	db, now := seeded(t)
+	standalone, err := serviceDoc(db, "api", false, "1h", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tab, err := serviceDoc(db, "api", true, "1h", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	titles := func(d document) (charts []string, types []any) {
+		for _, b := range d.Blocks {
+			types = append(types, b["type"])
+			if b["type"] == "chart" {
+				charts = append(charts, b["title"].(string))
+				if b["sync"] != "time" {
+					t.Errorf("charts share one time axis: %+v", b)
+				}
+			}
+		}
+		return
+	}
+	charts, tabTypes := titles(tab)
+	if len(charts) != 6 || charts[0] != "CPU, % of one core" || charts[5] != "Block write" {
+		t.Errorf("charts: %v", charts)
+	}
+	// A tab is inside the service's own page: no heading, no link out of it.
+	if tabTypes[0] != "choice" {
+		t.Errorf("a tab starts with the range: %v", tabTypes)
+	}
+	if _, types := titles(standalone); types[0] != "link" || types[1] != "heading" || types[2] != "choice" {
+		t.Errorf("a page of its own has a way back and a heading: %v", types)
+	}
+
+	// Points are [unix seconds, value] pairs.
+	cpu := tab.Blocks[1]["series"].([]block)[0]["points"].([][2]float64)
+	if len(cpu) != 3 || cpu[0][1] != 1 || cpu[2][1] != 3 { // the replicas are summed: (0+1), (1+1), (2+1)
+		t.Errorf("cpu points: %v", cpu)
+	}
+	if _, err := json.Marshal(tab); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServicePageAsksWhichServiceWhenNoneIsGiven(t *testing.T) {
+	db, _ := seeded(t)
+	page := func(query string) document {
 		rec := httptest.NewRecorder()
 		servicePage(rec, db, httptest.NewRequest("GET", "/service?"+query, nil))
-		if rec.Code != 200 {
+		if rec.Code != 200 || rec.Header().Get("Content-Type") != "application/json" {
 			t.Fatalf("%s: %d %s", query, rec.Code, rec.Body)
 		}
-		return rec.Body.String()
+		var d document
+		if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil {
+			t.Fatal(err)
+		}
+		return d
 	}
-
-	// The panel's tab: told the service as ?service=, shown inside a service.
-	tab := page("service=api&id=abc&stack=shop")
-	if strings.Contains(tab, "all services") || strings.Contains(tab, "<h1>api</h1>") {
-		t.Error("a tab must not repeat the service's heading or link out to the overview")
+	if d := page(""); d.Blocks[0]["type"] != "banner" {
+		t.Errorf("no service: %+v", d.Blocks)
 	}
-	if !strings.Contains(tab, "service?service=api&amp;range=") {
-		t.Error("the range links must keep telling the page which service it is")
+	// The panel's tab says ?service=, our own links ?name=; the range is kept apart.
+	if tab := page("service=api&id=abc&stack=shop&range=24h"); tab.Blocks[0]["value"] != "24h" {
+		t.Errorf("tab: %+v", tab.Blocks[0])
 	}
-
-	// Our own overview link: a page of its own.
-	own := page("name=api")
-	if !strings.Contains(own, "all services") || !strings.Contains(own, "<h1>api</h1>") || !strings.Contains(own, "service?name=api&amp;range=") {
-		t.Error("the standalone page lost its heading, its way back or its range links")
+	if own := page("name=api"); own.Blocks[0]["type"] != "link" {
+		t.Errorf("own page: %+v", own.Blocks[0])
 	}
-
-	rec := httptest.NewRecorder()
-	servicePage(rec, db, httptest.NewRequest("GET", "/service", nil))
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("no service at all: %d", rec.Code)
+	if d := page("name=api&range=forever"); d.Blocks[2]["value"] != "6h" {
+		t.Errorf("an unknown range is six hours: %+v", d.Blocks[2])
 	}
 }
