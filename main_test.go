@@ -73,11 +73,11 @@ func TestSaveAndSeries(t *testing.T) {
 	}
 }
 
-func TestManifestIsContractTwoWithTwoPagesOfBlocks(t *testing.T) {
+func TestManifestIsContractThreeWithTwoPages(t *testing.T) {
 	var m struct {
 		Contract      int `json:"contract"`
 		Contributions []struct {
-			Slot, Path, Role, Render string
+			Slot, Path, Role string
 		} `json:"contributions"`
 		Permissions []string `json:"permissions"`
 	}
@@ -90,11 +90,8 @@ func TestManifestIsContractTwoWithTwoPagesOfBlocks(t *testing.T) {
 		if c.Role != "viewer" {
 			t.Errorf("%s: the numbers are what the panel shows a viewer, got role %q", c.Slot, c.Role)
 		}
-		if c.Render != "ui" {
-			t.Errorf("%s: a page of blocks, not a frame: %q", c.Slot, c.Render)
-		}
 	}
-	if m.Contract != 2 || slots["nav"] != "/" || slots["service.tab"] != "/service" || len(m.Permissions) != 1 {
+	if m.Contract != 3 || slots["nav"] != "/" || slots["service.tab"] != "/service" || len(m.Permissions) != 1 {
 		t.Fatalf("%+v", m)
 	}
 }

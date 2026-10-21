@@ -52,16 +52,16 @@ func dur(v string, def time.Duration) time.Duration {
 	return d
 }
 
-// Contract 2 of the panel (docs/modules.md there): the menu entry, and a tab on
+// Contract 3 of the panel (docs/modules.md there): the menu entry, and a tab on
 // every service's page, both pages of blocks the panel draws. Viewers may see
 // the numbers: the panel's own Resources page shows them to a viewer too.
 const manifest = `{
-  "contract": 2,
+  "contract": 3,
   "name": "metrics",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "contributions": [
-    {"slot": "nav", "title": "Metrics", "path": "/", "role": "viewer", "render": "ui"},
-    {"slot": "service.tab", "title": "Metrics", "path": "/service", "role": "viewer", "render": "ui"}
+    {"slot": "nav", "title": "Metrics", "path": "/", "role": "viewer"},
+    {"slot": "service.tab", "title": "Metrics", "path": "/service", "role": "viewer"}
   ],
   "permissions": ["stats:read"]
 }`
