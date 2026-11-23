@@ -26,15 +26,17 @@ import (
 )
 
 var (
-	core      = or(os.Getenv("PANEL_CORE_URL"), "http://panel:8080")
-	dbPath    = or(os.Getenv("DB_PATH"), "/data/metrics.db")
-	interval  = dur(os.Getenv("SAMPLE_INTERVAL"), 30*time.Second)
-	retention = dur(os.Getenv("RETENTION"), 7*24*time.Hour)
+	core       = or(os.Getenv("PANEL_CORE_URL"), "http://panel:8080")
+	moduleName = or(os.Getenv("PANEL_MODULE_NAME"), "metrics")
+	dbPath     = or(os.Getenv("DB_PATH"), "/data/metrics.db")
+	interval   = dur(os.Getenv("SAMPLE_INTERVAL"), 30*time.Second)
+	retention  = dur(os.Getenv("RETENTION"), 7*24*time.Hour)
 
 	// [module, token]. Learned from the core's own requests, the manifest fetch
 	// included, so sampling starts within a discovery TTL of either side booting
 	// and survives the core changing its secret.
-	creds atomic.Pointer[[2]string]
+	creds               atomic.Pointer[[2]string]
+	checkingCredentials atomic.Bool
 )
 
 func or(v, def string) string {
@@ -131,7 +133,7 @@ func main() {
 	go sampler(db)
 
 	http.HandleFunc("/manifest", func(w http.ResponseWriter, r *http.Request) {
-		remember(r) // discovery carries the token: this is where it arrives first
+		remember(r)
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, manifest)
 	})
@@ -139,11 +141,9 @@ func main() {
 		io.WriteString(w, "ok")
 	})
 	http.HandleFunc("/service", func(w http.ResponseWriter, r *http.Request) {
-		remember(r)
 		servicePage(w, db, r)
 	})
 	http.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
-		remember(r)
 		overviewPage(w, db, r)
 	})
 
@@ -153,9 +153,38 @@ func main() {
 }
 
 func remember(r *http.Request) {
-	if m := r.Header.Get("X-Panel-Module"); m != "" {
-		creds.Store(&[2]string{m, r.Header.Get("X-Panel-Token")})
+	candidate := [2]string{r.Header.Get("X-Panel-Module"), r.Header.Get("X-Panel-Token")}
+	current := creds.Load()
+	if candidate[0] != moduleName || candidate[1] == "" ||
+		(current != nil && *current == candidate) || !checkingCredentials.CompareAndSwap(false, true) {
+		return
 	}
+	// Discovery must finish before the core can authorize our callback.
+	go func() {
+		defer checkingCredentials.Store(false)
+		if verifiedCredentials(candidate) {
+			creds.Store(&candidate)
+		}
+	}()
+}
+
+func verifiedCredentials(candidate [2]string) bool {
+	req, err := http.NewRequest(http.MethodGet, core+"/internal/stats", nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("X-Panel-Module", candidate[0])
+	req.Header.Set("X-Panel-Token", candidate[1])
+	client := &http.Client{
+		Timeout:       5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
 
 func sampler(db *sql.DB) {

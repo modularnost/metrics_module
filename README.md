@@ -33,6 +33,7 @@ the cluster has several managers.
 | | Default | |
 | --- | --- | --- |
 | `PANEL_CORE_URL` | `http://panel:8080` | |
+| `PANEL_MODULE_NAME` | `metrics` | must match the `panel.module.name` label |
 | `DB_PATH` | `/data/metrics.db` | |
 | `SAMPLE_INTERVAL` | `30s` | one `/internal/stats` call costs ~1s |
 | `RETENTION` | `168h` | older rows are deleted on every write |
@@ -40,9 +41,9 @@ the cluster has several managers.
 
 ## Token
 
-The core sends it with every `/manifest` fetch, so sampling starts within a
-discovery TTL (15s) of either side booting, and survives the core restarting
-with a new `PANEL_MODULE_SECRET`. Needs a core new enough to do that.
+The core sends the token with every `/manifest` fetch. The module checks a new
+token with the core before using it. This also refreshes the token when the
+core restarts with a new `PANEL_MODULE_SECRET`.
 
 ## What it keeps
 
