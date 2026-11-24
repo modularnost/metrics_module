@@ -9,17 +9,21 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -124,26 +128,44 @@ func openDB(path string) (*sql.DB, error) {
 }
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run(ctx context.Context) error {
 	db, err := openDB(dbPath)
 	if err != nil {
-		log.Fatalf("cannot open %s: %v", dbPath, err)
+		return fmt.Errorf("cannot open %s: %w", dbPath, err)
 	}
 	defer db.Close()
 
-	go sampler(db)
+	samplingCtx, cancel := context.WithCancel(ctx)
+	samplingDone := make(chan struct{})
+	go func() {
+		defer close(samplingDone)
+		sampler(samplingCtx, db)
+	}()
+	defer func() {
+		cancel()
+		<-samplingDone
+	}()
 
-	http.HandleFunc("/manifest", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/manifest", func(w http.ResponseWriter, r *http.Request) {
 		remember(r)
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, manifest)
 	})
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "ok")
 	})
-	http.HandleFunc("/service", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/service", func(w http.ResponseWriter, r *http.Request) {
 		servicePage(w, db, r)
 	})
-	http.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
 		overviewPage(w, db, r)
 	})
 
@@ -151,10 +173,28 @@ func main() {
 	log.Printf("metrics-module on %s, core %s, db %s, every %s, keeping %s", addr, core, dbPath, interval, retention)
 	server := &http.Server{
 		Addr:              addr,
+		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       time.Minute,
 	}
-	log.Fatal(server.ListenAndServe())
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.ListenAndServe() }()
+	select {
+	case err := <-serveErr:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			return errors.Join(err, server.Close())
+		}
+		if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	}
 }
 
 func remember(r *http.Request) {
@@ -193,34 +233,43 @@ func verifiedCredentials(candidate [2]string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-func sampler(db *sql.DB) {
-	for ; ; time.Sleep(interval) {
-		stats, err := fetchStats()
-		if err != nil {
-			log.Printf("sample skipped: %v", err)
-			continue
+func sampler(ctx context.Context, db *sql.DB) {
+	for ctx.Err() == nil {
+		if err := sample(ctx, db); err != nil && ctx.Err() == nil {
+			log.Print(err)
 		}
-		if err := save(db, time.Now(), stats); err != nil {
-			log.Printf("sample not stored: %v", err)
-			continue
-		}
-		// Nobody polls: the browsers that have a page open ask again when told.
-		for _, page := range []string{"/", "/service"} {
-			if err := changed(page); err != nil {
-				log.Printf("telling the panel about %s: %v", page, err)
-			}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
 		}
 	}
 }
 
+func sample(ctx context.Context, db *sql.DB) error {
+	stats, err := fetchStats(ctx)
+	if err != nil {
+		return fmt.Errorf("sample skipped: %w", err)
+	}
+	if err := save(ctx, db, time.Now(), stats); err != nil {
+		return fmt.Errorf("sample not stored: %w", err)
+	}
+	for _, page := range []string{"/", "/service"} {
+		if err := changed(ctx, page); err != nil && ctx.Err() == nil {
+			log.Printf("telling the panel about %s: %v", page, err)
+		}
+	}
+	return nil
+}
+
 const maxStatsResponse = 16 << 20
 
-func fetchStats() ([]stat, error) {
+func fetchStats(ctx context.Context) ([]stat, error) {
 	c := creds.Load()
 	if c == nil {
 		return nil, fmt.Errorf("no token yet: the core has not fetched /manifest")
 	}
-	req, err := http.NewRequest(http.MethodGet, core+"/internal/stats", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, core+"/internal/stats", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +300,7 @@ func fetchStats() ([]stat, error) {
 
 // save folds the per-replica rows into one row per service and drops whatever
 // fell out of the retention window.
-func save(db *sql.DB, now time.Time, stats []stat) error {
+func save(ctx context.Context, db *sql.DB, now time.Time, stats []stat) error {
 	type agg struct {
 		stack                 string
 		cpu                   float64
@@ -285,22 +334,22 @@ func save(db *sql.DB, now time.Time, stats []stat) error {
 		a.count++
 	}
 
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	ins, err := tx.Prepare(`INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+	ins, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
 	ts := now.Unix()
 	for name, a := range byService {
-		if _, err := ins.Exec(ts, name, a.stack, a.cpu, a.mem, a.limit, a.netRX, a.netTX, a.blockRead, a.blockWrite, a.count); err != nil {
+		if _, err := ins.ExecContext(ctx, ts, name, a.stack, a.cpu, a.mem, a.limit, a.netRX, a.netTX, a.blockRead, a.blockWrite, a.count); err != nil {
 			return err
 		}
 	}
-	if _, err := tx.Exec(`DELETE FROM samples WHERE ts < ?`, now.Add(-retention).Unix()); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM samples WHERE ts < ?`, now.Add(-retention).Unix()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -471,12 +520,12 @@ func write(w http.ResponseWriter, d document) {
 }
 
 // changed tells the panel that a page of ours is different now.
-func changed(page string) error {
+func changed(ctx context.Context, page string) error {
 	c := creds.Load()
 	if c == nil {
 		return fmt.Errorf("no token yet")
 	}
-	req, err := http.NewRequest(http.MethodPost, core+"/internal/ui/changed", bytes.NewBufferString(fmt.Sprintf(`{"path":%q}`, page)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, core+"/internal/ui/changed", bytes.NewBufferString(fmt.Sprintf(`{"path":%q}`, page)))
 	if err != nil {
 		return err
 	}

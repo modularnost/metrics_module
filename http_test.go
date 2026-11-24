@@ -21,7 +21,7 @@ func TestFetchStatsRejectsOversizeResponse(t *testing.T) {
 	core = server.URL
 	t.Cleanup(func() { core = oldCore; creds.Store(oldCreds) })
 
-	stats, err := fetchStats()
+	stats, err := fetchStats(t.Context())
 	if stats != nil || err == nil || !strings.Contains(err.Error(), "stats response exceeds") {
 		t.Fatalf("fetchStats returned %v, %v", stats, err)
 	}
