@@ -6,8 +6,10 @@ COPY main.go .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /module .
 
 FROM alpine:3.22
+RUN apk add --no-cache su-exec
 COPY --from=build /module /module
+COPY --chmod=755 docker-entrypoint.sh /entrypoint
 VOLUME /data
 EXPOSE 8080
 HEALTHCHECK CMD wget -qO- http://127.0.0.1:8080/health || exit 1
-ENTRYPOINT ["/module"]
+ENTRYPOINT ["/entrypoint"]
