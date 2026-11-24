@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -15,24 +17,24 @@ func TestSaveAndSeries(t *testing.T) {
 	}
 	defer db.Close()
 
-	now := time.Now()
+	now := time.Now().Truncate(time.Minute)
 	stats := []stat{
 		{Node: "n1", Service: "api", Stack: "shop", Slot: 1, CPU: 10, Mem: 100, MemLimit: 1000, NetRX: 100, BlockWrite: 30},
 		{Node: "n2", Service: "api", Stack: "shop", Slot: 2, CPU: 5, Mem: 50, MemLimit: 1000, NetRX: 50, BlockWrite: 10},
 		{Node: "n2", Service: "db", Stack: "shop", CPU: 1, Mem: 10},
 		{Node: "n3", Err: "unreachable"},
 	}
-	if err := save(db, now, stats); err != nil {
+	if err := save(t.Context(), db, now, stats); err != nil {
 		t.Fatal(err)
 	}
-	if err := save(db, now.Add(-2*time.Hour), stats); err != nil {
+	if err := save(t.Context(), db, now.Add(-2*time.Hour), stats); err != nil {
 		t.Fatal(err)
 	}
 	// Older than the retention window: must not survive the next write.
-	if err := save(db, now.Add(-retention-time.Hour), stats); err != nil {
+	if err := save(t.Context(), db, now.Add(-retention-time.Hour), stats); err != nil {
 		t.Fatal(err)
 	}
-	if err := save(db, now.Add(time.Second), stats); err != nil {
+	if err := save(t.Context(), db, now.Add(time.Second), stats); err != nil {
 		t.Fatal(err)
 	}
 
@@ -107,11 +109,48 @@ func seeded(t *testing.T) (*sql.DB, time.Time) {
 	for i := range 3 {
 		s := []stat{{Node: "n1", Service: "api", Stack: "shop", Slot: 1, CPU: float64(i), Mem: 100, MemLimit: 1000, NetRX: uint64(100 * i)},
 			{Node: "n2", Service: "api", Stack: "shop", Slot: 2, CPU: 1, Mem: 50, MemLimit: 1000}}
-		if err := save(db, now.Add(-time.Duration(2-i)*time.Minute), s); err != nil {
+		if err := save(t.Context(), db, now.Add(-time.Duration(2-i)*time.Minute), s); err != nil {
 			t.Fatal(err)
 		}
 	}
 	return db, now
+}
+
+func TestSamplerCancelsInFlightRequest(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	coreServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer coreServer.Close()
+	defer close(release)
+	oldCore, oldCreds := core, creds.Swap(&[2]string{"metrics", "test-token"})
+	core = coreServer.URL
+	t.Cleanup(func() {
+		core = oldCore
+		creds.Store(oldCreds)
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sampler(ctx, nil)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stats request never started")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sampler did not stop after cancellation")
+	}
 }
 
 func TestOverviewIsATableOfServicesWithLinksIntoTheModule(t *testing.T) {
