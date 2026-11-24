@@ -28,6 +28,12 @@ docker service create --name metrics_module   --network panelnet   --label panel
 The volume holds the history, so it must stay on one node — pin a hostname if
 the cluster has several managers.
 
+The Metrics process runs as UID and GID `10001`. The entrypoint updates the
+ownership of `/data` and the default SQLite files before dropping privileges,
+so named volumes from earlier images can be reused. For a custom `DB_PATH`
+or a service with an explicit user, give that user write access to the
+database, its sidecars, and its parent directory before upgrading.
+
 ## Environment
 
 | | Default | |
@@ -46,6 +52,9 @@ token with the core before using it. This also refreshes the token when the
 core restarts with a new `PANEL_MODULE_SECRET`.
 
 ## What it keeps
+
+The module accepts stats responses up to 16 MiB. A larger response is logged
+and the sample is skipped.
 
 One row per service per tick: CPU, memory and cumulative traffic/I/O summed
 across replicas, memory limit per replica, replica count. Traffic and I/O

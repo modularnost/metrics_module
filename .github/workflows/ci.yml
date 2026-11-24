@@ -13,35 +13,47 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.26"
+          go-version: "1.26.11"
           cache: true
       - run: go vet ./...
       - run: go test ./...
+      - name: Check Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
 
   publish:
-    # Pull requests only get built, never pushed: a fork must not be able to
-    # publish an image under our name.
+    # Build and publish release candidates only after a trusted push.
     if: github.event_name == 'push'
     needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    services:
+      registry:
+        image: registry:3@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c
+        ports:
+          - 127.0.0.1:5000:5000
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          image: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8c0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: network=host
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.IMAGE }}
           # latest follows releases, not main: the README tells people to
@@ -53,12 +65,41 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=edge,branch=main
             type=sha,format=short
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: localhost:5000/metrics:candidate
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Scan both image platforms
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            docker run --rm --network host -v "$RUNNER_TEMP/trivy:/root/.cache/trivy" \
+              aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb \
+              image --no-progress --image-src remote --insecure --platform "$platform" --scanners vuln \
+              --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "localhost:5000/metrics@$DIGEST"
+          done
+      - name: Publish the scanned digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          if ! command -v skopeo >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y skopeo
+          fi
+          while IFS= read -r tag; do
+            skopeo copy --all --preserve-digests --src-tls-verify=false \
+              --dest-authfile "$HOME/.docker/config.json" \
+              --digestfile "$RUNNER_TEMP/published.digest" \
+              "docker://localhost:5000/metrics@$DIGEST" "docker://$tag"
+            test "$(cat "$RUNNER_TEMP/published.digest")" = "$DIGEST"
+          done <<< "$TAGS"
