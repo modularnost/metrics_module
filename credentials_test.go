@@ -11,6 +11,9 @@ func TestDiscoveryCredentialsRequireCoreAcceptance(t *testing.T) {
 		if r.Method != http.MethodGet || r.URL.Path != "/internal/stats" {
 			t.Errorf("unexpected validation request: %s %s", r.Method, r.URL.Path)
 		}
+		if got := r.URL.Query().Get("service"); got != "__verify__" {
+			t.Errorf("verification service filter = %q", got)
+		}
 		if r.Header.Get("X-Panel-Module") == "metrics" && r.Header.Get("X-Panel-Token") == "current" {
 			w.WriteHeader(http.StatusOK)
 			return

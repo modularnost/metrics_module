@@ -169,14 +169,15 @@ func remember(r *http.Request) {
 }
 
 func verifiedCredentials(candidate [2]string) bool {
-	req, err := http.NewRequest(http.MethodGet, core+"/internal/stats", nil)
+	req, err := http.NewRequest(http.MethodGet, core+"/internal/stats?service=__verify__", nil)
 	if err != nil {
 		return false
 	}
 	req.Header.Set("X-Panel-Module", candidate[0])
 	req.Header.Set("X-Panel-Token", candidate[1])
 	client := &http.Client{
-		Timeout:       5 * time.Second,
+		// Discovery can be waiting for other modules to respond.
+		Timeout:       15 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	resp, err := client.Do(req)
