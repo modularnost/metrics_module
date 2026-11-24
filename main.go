@@ -130,7 +130,8 @@ func main() {
 	}
 	defer db.Close()
 
-	go sampler(db)
+	var history serviceHistory
+	go sampler(db, &history)
 
 	http.HandleFunc("/manifest", func(w http.ResponseWriter, r *http.Request) {
 		remember(r)
@@ -141,7 +142,7 @@ func main() {
 		io.WriteString(w, "ok")
 	})
 	http.HandleFunc("/service", func(w http.ResponseWriter, r *http.Request) {
-		servicePage(w, db, r)
+		history.servicePage(w, db, r)
 	})
 	http.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
 		overviewPage(w, db, r)
@@ -187,7 +188,7 @@ func verifiedCredentials(candidate [2]string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-func sampler(db *sql.DB) {
+func sampler(db *sql.DB, history *serviceHistory) {
 	for ; ; time.Sleep(interval) {
 		stats, err := fetchStats()
 		if err != nil {
@@ -198,6 +199,7 @@ func sampler(db *sql.DB) {
 			log.Printf("sample not stored: %v", err)
 			continue
 		}
+		history.clear()
 		// Nobody polls: the browsers that have a page open ask again when told.
 		for _, page := range []string{"/", "/service"} {
 			if err := changed(page); err != nil {
@@ -588,16 +590,18 @@ func serviceDoc(db *sql.DB, name string, tab bool, rangeLabel string, now time.T
 	return document{UI: 1, Blocks: append(blocks, charts...)}, nil
 }
 
-func servicePage(w http.ResponseWriter, db *sql.DB, r *http.Request) {
+func (h *serviceHistory) servicePage(w http.ResponseWriter, db *sql.DB, r *http.Request) {
 	name, tab := serviceOf(r)
 	if name == "" {
 		write(w, document{UI: 1, Blocks: []block{{"type": "banner", "tone": "warning", "text": "Open a service from the list to see its history."}}})
 		return
 	}
-	doc, err := serviceDoc(db, name, tab, r.URL.Query().Get("range"), time.Now())
+	label, _ := rangeOf(r.URL.Query().Get("range"))
+	body, err := h.get(r.Context(), db, historyKey{service: name, rangeLabel: label, tab: tab}, time.Now())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	write(w, doc)
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
 }

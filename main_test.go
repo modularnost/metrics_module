@@ -15,7 +15,7 @@ func TestSaveAndSeries(t *testing.T) {
 	}
 	defer db.Close()
 
-	now := time.Now()
+	now := time.Now().Truncate(time.Minute)
 	stats := []stat{
 		{Node: "n1", Service: "api", Stack: "shop", Slot: 1, CPU: 10, Mem: 100, MemLimit: 1000, NetRX: 100, BlockWrite: 30},
 		{Node: "n2", Service: "api", Stack: "shop", Slot: 2, CPU: 5, Mem: 50, MemLimit: 1000, NetRX: 50, BlockWrite: 10},
@@ -191,7 +191,7 @@ func TestServicePageAsksWhichServiceWhenNoneIsGiven(t *testing.T) {
 	db, _ := seeded(t)
 	page := func(query string) document {
 		rec := httptest.NewRecorder()
-		servicePage(rec, db, httptest.NewRequest("GET", "/service?"+query, nil))
+		new(serviceHistory).servicePage(rec, db, httptest.NewRequest("GET", "/service?"+query, nil))
 		if rec.Code != 200 || rec.Header().Get("Content-Type") != "application/json" {
 			t.Fatalf("%s: %d %s", query, rec.Code, rec.Body)
 		}
