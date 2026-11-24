@@ -9,7 +9,9 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o
 
 FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f
 COPY --from=build /module /module
+RUN apk add --no-cache su-exec
+COPY --chmod=755 docker-entrypoint.sh /entrypoint
 VOLUME /data
 EXPOSE 8080
 HEALTHCHECK CMD wget -qO- http://127.0.0.1:8080/health || exit 1
-ENTRYPOINT ["/module"]
+ENTRYPOINT ["/entrypoint"]

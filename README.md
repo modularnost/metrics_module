@@ -28,6 +28,12 @@ docker service create --name metrics_module   --network panelnet   --label panel
 The volume holds the history, so it must stay on one node — pin a hostname if
 the cluster has several managers.
 
+The Metrics process runs as UID and GID `10001`. The entrypoint updates the
+ownership of `/data` and the default SQLite files before dropping privileges,
+so named volumes from earlier images can be reused. For a custom `DB_PATH`
+or a service with an explicit user, give that user write access to the
+database, its sidecars, and its parent directory before upgrading.
+
 ## Environment
 
 | | Default | |
