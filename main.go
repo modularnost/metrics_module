@@ -328,67 +328,41 @@ func latest(db *sql.DB, now time.Time) ([]row, error) {
 	return out, rs.Err()
 }
 
-// series buckets a service's history so a chart never draws more points than a
-// screen can show, whatever the range.
-func series(db *sql.DB, service string, from, to time.Time, buckets int) (cpu, mem []point, err error) {
+func series(db *sql.DB, service string, from, to time.Time, buckets int) (cpu, mem []point, rates [4][]point, err error) {
 	width := (to.Unix() - from.Unix()) / int64(buckets)
 	if width < 1 {
 		width = 1
 	}
 	rs, err := db.Query(`
-		SELECT (ts/?)*? AS b, AVG(cpu), AVG(mem)
+		SELECT (ts/?)*? AS b, AVG(cpu), AVG(mem),
+		       AVG(net_rx), AVG(net_tx), AVG(block_read), AVG(block_write)
 		FROM samples WHERE service = ? AND ts >= ? AND ts <= ?
 		GROUP BY b ORDER BY b`, width, width, service, from.Unix(), to.Unix())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, rates, err
 	}
 	defer rs.Close()
+	var previousTime int64
+	var previous [4]float64
 	for rs.Next() {
 		var t int64
 		var c, m float64
-		if err := rs.Scan(&t, &c, &m); err != nil {
-			return nil, nil, err
+		var counters [4]float64
+		if err := rs.Scan(&t, &c, &m, &counters[0], &counters[1], &counters[2], &counters[3]); err != nil {
+			return nil, nil, [4][]point{}, err
 		}
 		cpu = append(cpu, point{t, c})
 		mem = append(mem, point{t, m})
-	}
-	return cpu, mem, rs.Err()
-}
-
-// counterSeries turns cumulative Docker counters into bytes per second. A
-// restarted container resets its counter; that interval is shown as zero.
-func counterSeries(db *sql.DB, service, column string, from, to time.Time, buckets int) ([]point, error) {
-	if column != "net_rx" && column != "net_tx" && column != "block_read" && column != "block_write" {
-		return nil, fmt.Errorf("unknown counter %q", column)
-	}
-	width := (to.Unix() - from.Unix()) / int64(buckets)
-	if width < 1 {
-		width = 1
-	}
-	rs, err := db.Query(`SELECT (ts/?)*? AS b, AVG(`+column+`)
-		FROM samples WHERE service = ? AND ts >= ? AND ts <= ?
-		GROUP BY b ORDER BY b`, width, width, service, from.Unix(), to.Unix())
-	if err != nil {
-		return nil, err
-	}
-	defer rs.Close()
-	var out []point
-	var prev point
-	for rs.Next() {
-		var current point
-		if err := rs.Scan(&current.T, &current.V); err != nil {
-			return nil, err
-		}
-		if prev.T != 0 && current.T > prev.T {
-			v := (current.V - prev.V) / float64(current.T-prev.T)
-			if v < 0 {
-				v = 0
+		if previousTime != 0 && t > previousTime {
+			for i, current := range counters {
+				// A restarted container resets its counter.
+				rate := max(0, (current-previous[i])/float64(t-previousTime))
+				rates[i] = append(rates[i], point{t, rate})
 			}
-			out = append(out, point{current.T, v})
 		}
-		prev = current
+		previousTime, previous = t, counters
 	}
-	return out, rs.Err()
+	return cpu, mem, rates, rs.Err()
 }
 
 func since(sec int64) string {
@@ -557,7 +531,7 @@ func serviceDoc(db *sql.DB, name string, tab bool, rangeLabel string, now time.T
 	from := now.Add(-d)
 	const buckets = 180
 
-	cpu, mem, err := series(db, name, from, now, buckets)
+	cpu, mem, rates, err := series(db, name, from, now, buckets)
 	if err != nil {
 		return document{}, err
 	}
@@ -566,14 +540,8 @@ func serviceDoc(db *sql.DB, name string, tab bool, rangeLabel string, now time.T
 			"empty": "No samples in this range.", "series": []block{{"name": title, "points": points(pts)}}}
 	}
 	charts := []block{chart("CPU, % of one core", "percent", cpu), chart("Memory", "bytes", mem)}
-	for _, c := range []struct{ title, column string }{
-		{"Network receive", "net_rx"}, {"Network transmit", "net_tx"}, {"Block read", "block_read"}, {"Block write", "block_write"},
-	} {
-		pts, err := counterSeries(db, name, c.column, from, now, buckets)
-		if err != nil {
-			return document{}, err
-		}
-		charts = append(charts, chart(c.title, "bytes/s", pts))
+	for i, title := range [...]string{"Network receive", "Network transmit", "Block read", "Block write"} {
+		charts = append(charts, chart(title, "bytes/s", rates[i]))
 	}
 
 	options := make([]block, len(ranges))
