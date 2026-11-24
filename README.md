@@ -47,6 +47,9 @@ core restarts with a new `PANEL_MODULE_SECRET`.
 
 ## What it keeps
 
+The module accepts stats responses up to 16 MiB. A larger response is logged
+and the sample is skipped.
+
 One row per service per tick: CPU, memory and cumulative traffic/I/O summed
 across replicas, memory limit per replica, replica count. Traffic and I/O
 graphs calculate bytes/s from adjacent samples. At 30s that is ~2900 rows per

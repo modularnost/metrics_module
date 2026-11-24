@@ -149,7 +149,12 @@ func main() {
 
 	addr := or(os.Getenv("ADDR"), ":8080")
 	log.Printf("metrics-module on %s, core %s, db %s, every %s, keeping %s", addr, core, dbPath, interval, retention)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	server := &http.Server{
+		Addr:              addr,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       time.Minute,
+	}
+	log.Fatal(server.ListenAndServe())
 }
 
 func remember(r *http.Request) {
@@ -207,6 +212,8 @@ func sampler(db *sql.DB) {
 	}
 }
 
+const maxStatsResponse = 16 << 20
+
 func fetchStats() ([]stat, error) {
 	c := creds.Load()
 	if c == nil {
@@ -227,8 +234,18 @@ func fetchStats() ([]stat, error) {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxStatsResponse+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxStatsResponse {
+		return nil, fmt.Errorf("stats response exceeds %d bytes", maxStatsResponse)
+	}
 	var stats []stat
-	return stats, json.NewDecoder(resp.Body).Decode(&stats)
+	if err := json.Unmarshal(body, &stats); err != nil {
+		return nil, err
+	}
+	return stats, nil
 }
 
 // save folds the per-replica rows into one row per service and drops whatever
