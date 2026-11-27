@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -195,7 +196,7 @@ func verifiedCredentials(candidate [2]string) bool {
 
 func sampler(db *sql.DB) {
 	for ; ; time.Sleep(interval) {
-		stats, err := fetchStats()
+		stats, watched, err := fetchStats()
 		if err != nil {
 			log.Printf("sample skipped: %v", err)
 			continue
@@ -204,8 +205,7 @@ func sampler(db *sql.DB) {
 			log.Printf("sample not stored: %v", err)
 			continue
 		}
-		// Nobody polls: the browsers that have a page open ask again when told.
-		for _, page := range []string{"/", "/service"} {
+		for _, page := range notificationPages(watched) {
 			if err := changed(page); err != nil {
 				log.Printf("telling the panel about %s: %v", page, err)
 			}
@@ -215,38 +215,50 @@ func sampler(db *sql.DB) {
 
 const maxStatsResponse = 16 << 20
 
-func fetchStats() ([]stat, error) {
+func notificationPages(hint string) []string {
+	if hint == "none" {
+		return nil
+	}
+	pages := []string{"/", "/service"}
+	values, err := url.ParseQuery(hint)
+	if err != nil || len(values["path"]) == 0 {
+		return pages
+	}
+	return slices.DeleteFunc(pages, func(p string) bool { return !slices.Contains(values["path"], p) })
+}
+
+func fetchStats() ([]stat, string, error) {
 	c := creds.Load()
 	if c == nil {
-		return nil, fmt.Errorf("no token yet: the core has not fetched /manifest")
+		return nil, "", fmt.Errorf("no token yet: the core has not fetched /manifest")
 	}
-	req, err := http.NewRequest(http.MethodGet, core+"/internal/stats", nil)
+	req, err := http.NewRequest(http.MethodGet, core+"/internal/stats?page_interest=1", nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req.Header.Set("X-Panel-Module", c[0])
 	req.Header.Set("X-Panel-Token", c[1])
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil, "", fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxStatsResponse+1))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(body) > maxStatsResponse {
-		return nil, fmt.Errorf("stats response exceeds %d bytes", maxStatsResponse)
+		return nil, "", fmt.Errorf("stats response exceeds %d bytes", maxStatsResponse)
 	}
 	var stats []stat
 	if err := json.Unmarshal(body, &stats); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return stats, nil
+	return stats, resp.Header.Get("X-Panel-Watched-Pages"), nil
 }
 
 // save folds the per-replica rows into one row per service and drops whatever

@@ -7,8 +7,10 @@ core, kept in SQLite, sent as charts the panel draws. Permission: `stats:read`.
 It adds a **Metrics** entry to the menu and a **Metrics** tab to every
 service's page. Both are pages of blocks (a table, a chart per number, a range
 to pick) that the panel draws in its own look, theme and phone layout; the
-module sends numbers and units, not HTML. After every sample it tells the panel,
-and an open page updates by itself.
+module sends numbers and units, not HTML. Open pages refresh after each sample.
+When the panel reports which pages have viewers, Metrics sends change
+notifications only for those pages. Older panels still receive both
+notifications after each sample.
 
 Needs a panel that reads a `contract` 3 manifest, the one without frames. A panel
 of contract 2 shows the module as failed, and `0.3.0` of the module is the last
