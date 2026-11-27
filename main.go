@@ -106,22 +106,51 @@ CREATE TABLE IF NOT EXISTS samples (
 CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);`
 
 func openDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(schema); err != nil {
+	if err := migrateSamples(db); err != nil {
+		db.Close()
 		return nil, err
 	}
-	for _, column := range []string{
-		"net_rx INTEGER NOT NULL DEFAULT 0", "net_tx INTEGER NOT NULL DEFAULT 0",
-		"block_read INTEGER NOT NULL DEFAULT 0", "block_write INTEGER NOT NULL DEFAULT 0",
-	} {
-		if _, err := db.Exec("ALTER TABLE samples ADD COLUMN " + column); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
-			return nil, err
+	return db, nil
+}
+
+func migrateSamples(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(schema); err != nil {
+		return err
+	}
+	rows, err := tx.Query("SELECT name FROM pragma_table_info('samples')")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	existing := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, name := range []string{"net_rx", "net_tx", "block_read", "block_write"} {
+		if existing[name] {
+			continue
+		}
+		if _, err := tx.Exec("ALTER TABLE samples ADD COLUMN " + name + " INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
 		}
 	}
-	return db, nil
+	return tx.Commit()
 }
 
 func main() {
@@ -302,7 +331,9 @@ func save(db *sql.DB, now time.Time, stats []stat) error {
 		return err
 	}
 	defer tx.Rollback()
-	ins, err := tx.Prepare(`INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+	ins, err := tx.Prepare(`INSERT OR REPLACE INTO samples
+		(ts, service, stack, cpu, mem, mem_limit, net_rx, net_tx, block_read, block_write, replicas)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}

@@ -15,7 +15,7 @@ func TestSaveAndSeries(t *testing.T) {
 	}
 	defer db.Close()
 
-	now := time.Now()
+	now := time.Now().Truncate(time.Minute)
 	stats := []stat{
 		{Node: "n1", Service: "api", Stack: "shop", Slot: 1, CPU: 10, Mem: 100, MemLimit: 1000, NetRX: 100, BlockWrite: 30},
 		{Node: "n2", Service: "api", Stack: "shop", Slot: 2, CPU: 5, Mem: 50, MemLimit: 1000, NetRX: 50, BlockWrite: 10},
@@ -70,6 +70,45 @@ func TestSaveAndSeries(t *testing.T) {
 	}
 	if _, err := counterSeries(db, "api", "not-a-column", now, now, 1); err == nil {
 		t.Error("unknown counter column accepted")
+	}
+}
+
+func TestOpenDBUpgradesLegacySamples(t *testing.T) {
+	path := t.TempDir() + "/legacy.db"
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE samples (
+		ts INTEGER NOT NULL, service TEXT NOT NULL, stack TEXT NOT NULL DEFAULT '',
+		cpu REAL NOT NULL, mem INTEGER NOT NULL, mem_limit INTEGER NOT NULL,
+		replicas INTEGER NOT NULL, PRIMARY KEY (service, ts)
+	) WITHOUT ROWID;
+	INSERT INTO samples VALUES (100, 'api', '', 1, 2, 3, 4);`)
+	legacy.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		db, err := openDB(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if err := save(db, time.Unix(101, 0), []stat{{Service: "api", NetRX: 17, NetTX: 23, BlockRead: 31, BlockWrite: 47}}); err != nil {
+			t.Fatal(err)
+		}
+		for _, target := range []struct {
+			ts   int
+			want [5]int
+		}{{100, [5]int{0, 0, 0, 0, 4}}, {101, [5]int{17, 23, 31, 47, 1}}} {
+			var got [5]int
+			err := db.QueryRow(`SELECT net_rx, net_tx, block_read, block_write, replicas FROM samples WHERE ts = ?`, target.ts).
+				Scan(&got[0], &got[1], &got[2], &got[3], &got[4])
+			if err != nil || got != target.want {
+				t.Fatalf("sample %d: got %v, err %v, want %v", target.ts, got, err, target.want)
+			}
+		}
 	}
 }
 
