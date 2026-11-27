@@ -15,7 +15,7 @@ func TestSaveAndSeries(t *testing.T) {
 	}
 	defer db.Close()
 
-	now := time.Now()
+	now := time.Now().Truncate(time.Minute)
 	stats := []stat{
 		{Node: "n1", Service: "api", Stack: "shop", Slot: 1, CPU: 10, Mem: 100, MemLimit: 1000, NetRX: 100, BlockWrite: 30},
 		{Node: "n2", Service: "api", Stack: "shop", Slot: 2, CPU: 5, Mem: 50, MemLimit: 1000, NetRX: 50, BlockWrite: 10},
@@ -54,7 +54,7 @@ func TestSaveAndSeries(t *testing.T) {
 		t.Fatalf("network counters not summed: %d, %v", netRX, err)
 	}
 
-	cpu, mem, err := series(db, "api", now.Add(-3*time.Hour), now.Add(time.Minute), 180)
+	cpu, mem, rates, err := series(db, "api", now.Add(-3*time.Hour), now.Add(time.Minute), 180)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,12 +64,35 @@ func TestSaveAndSeries(t *testing.T) {
 	if cpu[1].V != 15 || mem[1].V != 150 {
 		t.Errorf("bucket values wrong: %v %v", cpu[1], mem[1])
 	}
-	net, err := counterSeries(db, "api", "net_rx", now.Add(-3*time.Hour), now.Add(time.Minute), 180)
-	if err != nil || len(net) != 1 || net[0].V != 0 {
-		t.Errorf("counter series should handle equal samples: %v, %v", net, err)
+	for _, rate := range rates {
+		if len(rate) != 1 || rate[0].V != 0 || rate[0].T != cpu[1].T {
+			t.Errorf("counter series should handle equal samples: %v", rate)
+		}
 	}
-	if _, err := counterSeries(db, "api", "not-a-column", now, now, 1); err == nil {
-		t.Error("unknown counter column accepted")
+}
+
+func TestSeriesUsesEachCounterAndClampsResets(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/m.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i, s := range []stat{
+		{Service: "api", NetRX: 100, NetTX: 100, BlockRead: 250, BlockWrite: 10},
+		{Service: "api", NetRX: 110, NetTX: 120, BlockRead: 25, BlockWrite: 50},
+	} {
+		if err := save(db, time.Unix(100+int64(i)*10, 0), []stat{s}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _, rates, err := series(db, "api", time.Unix(100, 0), time.Unix(110, 0), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range [...]float64{1, 2, 0, 4} {
+		if got := rates[i]; len(got) != 1 || got[0] != (point{110, want}) {
+			t.Errorf("counter %d: got %v, want %v bytes/s at 110", i, got, want)
+		}
 	}
 }
 
